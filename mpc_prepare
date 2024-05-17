@@ -1,0 +1,240 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from numpy.linalg import inv
+from scipy.linalg import block_diag
+from math import sin, cos
+import math
+from numpy.linalg import cholesky #对称正定矩阵分解成一个下三角矩阵和其转置的乘积。
+from scipy.interpolate import interp1d #一维数据的插值
+from scipy.integrate import ode #求解常微分方程组的初值问题。
+from scipy.integrate import solve_ivp #求解常微分方程组的初值问题，支持更多的求解算法和选项。
+from scipy.linalg import expm #计算矩阵指数
+from scipy.linalg import solve_continuous_are #解决连续时间代数Riccati方程
+
+
+from pydrake.solvers import mathematicalprogram as mp
+from pydrake.solvers.osqp import OsqpSolver # type: ignore # 使用OSQP求解器进行优化
+from pydrake.solvers.snopt import SnoptSolver #用SNOPT求解器进行优化
+from pydrake.solvers.mathematicalprogram import MathematicalProgram, Solve #定义和求解优化问题
+import pydrake.symbolic as sym #符号计算
+
+from pydrake.all import MonomialBasis, OddDegreeMonomialBasis, Variables #多项式基础函数和变量的定义
+
+import pdb
+
+class Robot(object):
+  def __init__(self, Q, R, Qf):
+    # Input limits,
+    # TODO：待定，角加速度的变化率
+    self.umin   = np.array([-7500, -3750, -5000, -6250, -7500, -10000])
+    self.umax   = np.array([ 7500,  3750,  5000,  6250,  7500,  10000])
+    self.Q      = Q
+    self.R      = R
+    self.Qf     = Qf
+
+    #Limits are on ----------joints,  velocities, accelerations-----------------
+    # TODO：加速度待定
+    self.xmax   = np.array([ 2.6,  3.1,  5,  
+                             2.9,  3.1,  5,  
+                             0.0,  3.1,  5, 
+                             1.5, 3.1,  5,  
+                             1.3,  3.1,  5, 
+                             2.7,  3.1,  5])
+    #Limits are on ----------joints,  velocities, accelerations-----------------
+    self.xmin   = np.array([ -2.6, -3.1,  -5,  
+                             0.0,  -3.1  -5,  
+                             -2.8,  -3.1,  -5, 
+                             -1.5,  -3.1,  -5,  
+                             -1.3,  -3.1,  -5, 
+                             -2.7,  -3.1,  -5])
+    #储存新的状态约束
+    self.xl = [] 
+    self.xu = []  
+
+  def new_constraints(self, new_constraints_param):
+    self.xu.append(np.array([np.abs(new_constraints_param[0]),  3.1415,  5,  
+                             np.abs(new_constraints_param[1]), 3.1415,  5,  
+                             np.abs(new_constraints_param[2]), 3.1415,  5, 
+                             np.abs(new_constraints_param[3]), 3.1415,  5,  
+                             np.abs(new_constraints_param[4]), 3.1415,  5, 
+                             np.abs(new_constraints_param[5]), 3.1415,  5]))
+
+
+    self.xl.append(np.array([(-1) * np.abs(new_constraints_param[0]), -3.1415,  -5,  
+                             (-1) * np.abs(new_constraints_param[1]), -3.1415,  -5,  
+                             (-1) * np.abs(new_constraints_param[2]), -3.1415,  -5, 
+                             (-1) * np.abs(new_constraints_param[3]), -3.1415,  -5,  
+                             (-1) * np.abs(new_constraints_param[4]), -3.1415,  -5, 
+                             (-1) * np.abs(new_constraints_param[5]), -3.1415,  -5]))
+
+
+  
+
+  def x_d(self):
+    # Nominal state
+    return np.zeros(18)
+
+
+  def u_d(self):
+    # Nominal input
+    return np.zeros(6)
+
+  def continuous_time_full_dynamics(self, x, u):
+    Ac = np.array([[0, 1, 0],
+                   [0, 0, 1],
+                   [0, 0, 0]])
+    
+    Bc = np.array([[0],[0],[1]])
+    
+    #Expand for 6D
+    A= block_diag(Ac, Ac, Ac, Ac, Ac, Ac)
+    B = block_diag(Bc, Bc, Bc, Bc, Bc, Bc)
+    xdot = A@(x) + B@(u) 
+    return xdot
+
+
+  def discrete_time_linearized_dynamics(self, N, time, tf):
+    n               = 18
+    I               = np.identity(n) 
+    tsim            = tf - time
+    h               = tsim/(N-1)
+    
+    phi_tilde       = np.array([[1, h, h**2/2], 
+                                [0, 1,      h], 
+                                [0, 0,      1]])
+    gamma_tilde     = np.array([[h**3/6], 
+                               [h**2/2], 
+                               [h]])
+    gamma1_tilde    = np.array([[h**4/24], 
+                                [h**3/6], 
+                                [h**2/2]])
+
+    phi             = block_diag(phi_tilde,     phi_tilde,      phi_tilde,      phi_tilde,      phi_tilde,      phi_tilde)
+    gamma1          = block_diag(gamma1_tilde,  gamma1_tilde,   gamma1_tilde,   gamma1_tilde,   gamma1_tilde,   gamma1_tilde)
+    gamma           = block_diag(gamma_tilde,   gamma_tilde,    gamma_tilde,    gamma_tilde,    gamma_tilde,    gamma_tilde)
+
+    return phi, gamma, gamma1, h
+
+  def add_initial_state_constraint(self, prog, x, x_current):
+    prog.AddLinearEqualityConstraint(x[0] - x_current, np.zeros(18))
+
+  def add_final_state_constraint(self, prog, x, x_final):
+    prog.AddLinearEqualityConstraint(x[-1] - x_final, np.zeros(18))
+
+  def add_input_saturation_constraint(self, prog, x, u, N):
+    for j in range(N-1):
+        prog.AddBoundingBoxConstraint((self.umin-self.u_d()), (self.umax-self.u_d()), u[j]) # syntax (lb, ub, vars)
+    for j in range(N):    
+        prog.AddBoundingBoxConstraint((self.xmin), (self.xmax), x[j]) # syntax (lb, ub, vars)
+
+
+  def add_dynamics_constraint(self, prog, x, u, N, time, tf):
+    phi, gamma, gamma1, h = self.discrete_time_linearized_dynamics(N, time, tf)
+    for k in range(1, N-1):
+        prog.AddLinearEqualityConstraint(x[k]-  phi@(x[k-1]) - (gamma1/h)@(u[k]) - (gamma - gamma1/h)@(u[k-1]), np.zeros(18))
+
+
+  def add_cost(self, prog, x, x_final, u, N):
+    for l in range(0, N-1):
+        err = x[l]-x_final
+        prog.AddQuadraticCost(err.T@(self.Q)@(err) + u[l].T@(self.R)@(u[l]))
+    prog.AddQuadraticCost((x[-1]-x_final)@(self.Q)@((x[-1]-x_final)))
+
+  # def compute_mpc_feedback(self, x_current, x_final, time, qconvex, tf):
+  def compute_mpc_feedback(self, x_current, x_final, time, tf):
+    '''
+    This function computes the MPC controller input u
+    '''
+    #TODO：待定 Parameters for the QP
+    N = 15
+
+    # Initialize mathematical program and decalre decision variables
+    prog = MathematicalProgram()
+    x = np.zeros((N, 18), dtype="object")
+    for i in range(N):
+      x[i] = prog.NewContinuousVariables(18, "x_" + str(i))
+    
+    u = np.zeros((N-1, 6), dtype="object")
+    for i in range(N-1):
+      u[i] = prog.NewContinuousVariables(6, "u_" + str(i))
+
+
+    # Add constraints and cost
+    self.add_initial_state_constraint(prog, x, x_current)
+    self.add_final_state_constraint(prog, x, x_final)
+    self.add_input_saturation_constraint(prog, x, u, N)
+    self.add_dynamics_constraint(prog, x, u, N, time, tf)
+
+    ##################### Uncomment this function to test for MPC based on Convex sub-regions #############################
+    #Add obstacle Cost
+    # self.add_obs_constraint(prog, x, qconvex, N)
+
+    
+    self.add_cost(prog, x, x_final, u, N)
+
+
+    # Solve the QP
+    solver = OsqpSolver()
+    result = solver.Solve(prog)
+
+    u_mpc = np.zeros(6)
+    u_mpc = result.GetSolution(u)
+    x_mpc = result.GetSolution(x)
+    """ print("u_mpc: ", (u_mpc+(self.u_d())))
+    print("x_mpc: ", (x_mpc+(self.x_d())))
+    print("x_mpc: ", (x_mpc))
+    print("___________________________________")
+    print(" ") """
+
+    optimal_cost = result.get_optimal_cost()
+
+    return (u_mpc[0]+(self.u_d())), optimal_cost
+  def simulate_arm(self,x0, x_final, tf):
+    t0        = 0.0
+    dt        = 1e-1  #Can reduce this value even further to improve computation time. However it might not converge
+    x         = [x0]
+    u         = [np.zeros((6,))]
+    t         = [t0]
+    xf        = np.array([x_final[0], x_final[3], x_final[6], x_final[9], x_final[12], x_final[15]])
+    current_q = np.array([x0[0], x0[3], x0[6], x0[9], x0[12], x0[15]])
+
+    error_list      = []
+    count           = 0
+
+      #change the below print statement to True if you want to visualise the loss/convergence value at each step of the MPC
+    printvar  = False
+
+    while np.linalg.norm(xf-current_q) > 1e-3 and t[-1] < tf:
+      
+      count+=1
+      if(printvar and count%10==0):
+          print("Error: ", np.linalg.norm(xf-current_q))
+          print("Time step: ", t[-1])
+          print(" ")
+
+      error_list.append(np.linalg.norm(xf-current_q))
+      current_x = x[-1]
+      current_q = np.array([current_x[0], current_x[3], current_x[6], current_x[9], current_x[12], current_x[15]])
+      current_time        = t[-1]
+
+      current_u_command   = np.zeros(6)
+      current_u_command, optimal_cost   = self.compute_mpc_feedback(current_x, x_final, current_time, tf)
+      current_u_real      = np.clip(current_u_command, self.umin, self.umax)
+
+  
+
+        # Autonomous ODE for constant inputs to work with solve_ivp
+      def f(t, x):
+            return self.continuous_time_full_dynamics(current_x, current_u_real)
+      sol = solve_ivp(f, (0, dt), current_x, first_step=dt)
+
+
+      # Record time, state, and inputs
+      t.append(t[-1] + dt)
+      x.append(sol.y[:, -1])
+      u.append(current_u_command)     
+    x = np.array(x)
+    u = np.array(u)
+    t = np.array(t)
+    
+    return x, u, t, error_list, optimal_cost
